@@ -3,12 +3,11 @@ Auto Messenger MCP Server (Context-Aware + Auto Trigger)
 ========================================================
 Features:
   - MCP tools: save_context, get_context, send_batch, etc.
-  - HTTP POST /trigger — call DeepSeek to generate 2-3 context-aware
-    messages every 5 minutes via cron-job.org
-  - get_pending / mark_sent — retrieve & confirm auto-generated messages
+  - Background auto-trigger: every 5 min, reads context via DeepSeek
+    and generates 2-3 context-aware messages into pending queue
+  - get_pending / send_pending — retrieve & send auto-generated messages
 
-Deploy: Render.com (free) or Fly.io
-Trigger: cron-job.org → POST /trigger every 5 min
+Deploy: Render.com (free) — no external cron needed!
 """
 
 import os
@@ -18,14 +17,10 @@ import argparse
 import asyncio
 import threading
 import time
+import re
 from datetime import datetime, timezone
 
 import httpx
-import uvicorn
-from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route
 from fastmcp import FastMCP
 
 # ── Logging ──────────────────────────────────────────────────────────
@@ -38,7 +33,6 @@ CONVERSATION_FILE = os.environ.get("CONVERSATION_FILE", "/tmp/auto-conversation.
 SERVER_NAME       = os.environ.get("SERVER_NAME", "Auto Messenger")
 DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_MODEL    = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-TRIGGER_SECRET    = os.environ.get("TRIGGER_SECRET", "")
 PENDING_FILE      = os.environ.get("PENDING_FILE", "/tmp/auto-pending.jsonl")
 
 _file_lock = threading.Lock()
@@ -244,71 +238,6 @@ def _fallback_messages() -> list[str]:
         "大家还在吗？👋",
         "上面的话题还挺有意思的~",
     ]
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  HTTP Trigger Endpoint (called by cron-job.org)
-# ═══════════════════════════════════════════════════════════════════════
-
-async def trigger_endpoint(request: Request) -> JSONResponse:
-    """
-    POST /trigger
-    Called by cron-job.org every 5 minutes.
-    Reads conversation context → calls DeepSeek → stores pending messages.
-    """
-    logger.info("TRIGGER CALLED!")  # <-- 先确认路由通了
-
-    # Optional: verify secret to prevent abuse
-    if TRIGGER_SECRET:
-        body = await request.body()
-        sig = request.headers.get("X-Trigger-Secret", "")
-        expected = hmac.new(TRIGGER_SECRET.encode(), body, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    # 1. Read recent context
-    entries = _read_entries(limit=30)
-    if not entries:
-        logger.info("Trigger: no context yet, skipping generation")
-        return JSONResponse({"status": "skipped", "reason": "no context"}, status_code=200)
-
-    context_text = _format_entries(entries)
-
-    # 2. Call DeepSeek to generate messages
-    messages = await call_deepseek(context_text)
-
-    if not messages:
-        return JSONResponse({"status": "skipped", "reason": "generation failed"}, status_code=200)
-
-    # 3. Store as pending (also send via webhook if configured)
-    batch_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    for i, msg in enumerate(messages):
-        _append_pending({
-            "batch_id": batch_id,
-            "index": i,
-            "content": msg,
-            "status": "pending",
-        })
-
-    # 4. Optionally send to webhook immediately
-    webhook_results = []
-    if WEBHOOK_URL:
-        for msg in messages:
-            try:
-                await post_to_webhook(msg)
-                webhook_results.append("ok")
-            except Exception as exc:
-                webhook_results.append(f"failed: {exc}")
-
-    logger.info("Trigger: generated %d messages (batch=%s)", len(messages), batch_id)
-
-    return JSONResponse({
-        "status": "ok",
-        "batch_id": batch_id,
-        "count": len(messages),
-        "messages": messages,
-        "webhook": webhook_results if webhook_results else "not configured",
-    }, status_code=200)
 
 
 # ═══════════════════════════════════════════════════════════════════════
