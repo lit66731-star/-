@@ -514,45 +514,29 @@ def main():
     logger.info("Webhook: %s", "configured" if WEBHOOK_URL else "NOT configured")
     logger.info("DeepSeek: %s", "configured" if DEEPSEEK_API_KEY else "NOT configured — trigger will fail!")
 
-    # ── Get FastMCP's ASGI app ──
-    mcp_app = None
-    for method_name in ["sse_app", "_create_app", "create_app", "build_app"]:
-        if hasattr(mcp, method_name):
-            try:
-                mcp_app = getattr(mcp, method_name)()
-                logger.info("Created MCP app via mcp.%s()", method_name)
-                break
-            except Exception as e:
-                logger.warning("mcp.%s() failed: %s", method_name, e)
+    # Create MCP app using the official sse_app() method
+    mcp_app = mcp.sse_app()
+    logger.info("MCP app created successfully, type=%s", type(mcp_app).__name__)
 
-    if mcp_app is None:
-        logger.info("Falling back to mcp.run()")
-        mcp.run(transport=args.transport, host=args.host, port=args.port)
-        return
+    # Build a patched ASGI app that intercepts POST /trigger
+    # This runs BEFORE the Starlette router, so it always matches first
+    original_app = mcp_app
 
-    # ── Inject /trigger route ──
-    from starlette.routing import Route as StarletteRoute
-    trigger_route = StarletteRoute("/trigger", trigger_endpoint, methods=["POST"])
-
-    if hasattr(mcp_app, "routes"):
-        mcp_app.routes.insert(0, trigger_route)
-        logger.info("Inserted /trigger route via routes list")
-    else:
-        # Fallback: wrap with ASGI middleware
-        logger.info("No routes list — using ASGI middleware wrapper")
-        _inner = mcp_app
-
-        async def asgi_wrapper(scope, receive, send):
-            if scope["type"] == "http" and scope.get("path") == "/trigger" and scope.get("method") == "POST":
+    async def patched_asgi(scope, receive, send):
+        # Check for trigger BEFORE any routing happens
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            method = scope.get("method", "")
+            logger.debug("Request: %s %s", method, path)
+            if path == "/trigger" and method == "POST":
                 request = Request(scope, receive, send)
                 response = await trigger_endpoint(request)
                 await response(scope, receive, send)
                 return
-            await _inner(scope, receive, send)
+        # All other requests go to FastMCP
+        await original_app(scope, receive, send)
 
-        mcp_app = asgi_wrapper
-
-    uvicorn.run(mcp_app, host=args.host, port=args.port)
+    uvicorn.run(patched_asgi, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
