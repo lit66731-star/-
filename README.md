@@ -1,24 +1,33 @@
-# Auto Messenger MCP Server
+# Auto Messenger MCP Server（上下文感知版）
 
-一个可部署到云端的 MCP 服务器，配合 iOS 上的 **Kelivo** App 使用，实现 **AI 自动定时发送消息**。
+一个可部署到云端的 MCP 服务器，配合 iOS 上的 **Kelivo** App 使用，实现 **AI 自动定时发送消息 — 基于聊天上下文，不乱发**。
+
+## 🧠 核心设计：上下文感知
+
+```
+用户发消息 → save_context(role="user")   → 存入对话记录
+AI 发消息  → send_message / send_batch  → 自动存为 assistant 记录
+                               ↓
+⏰ 5分钟后触发 → get_context() → 读取最近对话
+                               ↓
+              🤖 基于真实上下文生成 2-3 条自然接话
+                               ↓
+              send_batch() → 发送 + 自动存档
+```
+
+**不会乱发的原因**：每次生成前强制读取对话历史，AI 看到的是真实聊天内容，只能接着聊。
 
 ## 功能
 
-| 工具 | 说明 |
-|------|------|
-| `send_message` | 发送单条消息 |
-| `send_batch` | 批量发送 2-3 条消息（核心功能） |
-| `get_history` | 查看历史消息记录 |
-| `clear_history` | 清空历史记录 |
-
-## 工作流程
-
-```
-⏰ 每 5 分钟 → Kelivo 触发 Claude → 
-🤖 Claude 生成 2-3 条消息内容 → 
-📡 调用 MCP send_batch → 
-📤 消息发送/显示
-```
+| 分类 | 工具 | 说明 |
+|------|------|------|
+| 🧠 上下文 | `save_context` | 保存一条聊天记录（user/assistant/system） |
+| 🧠 上下文 | `get_context` | 读取最近 N 条对话，格式化输出 |
+| 🧠 上下文 | `get_last_user_message` | 快速获取用户最后一条消息 |
+| 📤 发送 | `send_message` | 发送单条消息 + 自动存档 |
+| 📤 发送 | `send_batch` | 批量发送 2-3 条 + 自动存档 |
+| 🔧 管理 | `get_stats` | 对话统计（总数、角色分布） |
+| 🔧 管理 | `clear_context` | 清空记录，开始新话题 |
 
 ---
 
@@ -90,31 +99,49 @@ fly deploy
 
 4. 保存，Kelivo 会自动连接
 
+### ⚠️ 使用前必须先"喂"上下文
+
+MCP 服务器本身不存储 Kelivo 的聊天记录。你需要让 AI 在**每次对话时**调用 `save_context` 保存聊天内容，这样定时触发时 `get_context` 才能读到历史。
+
+**在 Kelivo 的系统提示词（System Prompt）中加入：**
+
+```
+每次用户说话后，调用 save_context(role="user", content="用户的原话")。
+每次你回复后，调用 save_context(role="assistant", content="你的回复")。
+这样我才能记住对话上下文。
+```
+
 ---
 
 ## ⏰ 设置 5 分钟定时发送
 
-### 方法一：Kelivo 内置定时（如果有）
+### Kelivo 定时 Prompt（关键！）
 
-Kelivo 如有定时任务功能，设置每 5 分钟发送 prompt：
+在 Kelivo 的定时任务中，设置每 5 分钟执行以下 prompt：
 
 ```
-请生成 2-3 条有趣的消息并调用 send_batch 发送。
-消息要求：
-- 每条消息不同主题，避免重复
-- 可以是新闻摘要、冷知识、名言、笑话等
-- 查看 get_history 避免发送重复内容
+⚠️ 重要：你必须严格按以下步骤操作，不要跳过任何步骤。
+
+步骤 1：调用 get_context(limit=20) 读取最近的对话记录。
+
+步骤 2：基于以上对话上下文，生成 2-3 条自然的回复消息。
+要求：
+- 必须承接上一句对话内容，像正常人聊天一样
+- 不要突然换话题，不要发无关内容
+- 如果用户在问问题，就回答；如果在闲聊，就接着聊
+- 不要重复之前说过的话
+- 如果对话中断了（最后一条是你发的），就根据话题自然延伸
+
+步骤 3：调用 send_batch(messages=[...]) 发送你生成的 2-3 条消息。
+
+步骤 4：调用 save_context 保存你发的每条消息（role="assistant"）。
 ```
 
-### 方法二：Claude Code /loop（如果你在用 Claude Code）
+### 备用：Claude Code /loop
 
 ```bash
-claude "/loop 5m 请生成2-3条消息，调用 send_batch 发送。先调用 get_history 查看历史避免重复。"
+claude "/loop 5m 先调用 get_context 了解对话，然后基于上下文生成2-3条自然接话，用 send_batch 发送。"
 ```
-
-### 方法三：外部 Cron 服务（免费）
-
-用 [cron-job.org](https://cron-job.org)（免费）定时 ping 你的服务器，触发 Kelivo 动作。
 
 ---
 
