@@ -513,16 +513,44 @@ def main():
     logger.info("Starting '%s' on %s:%d (transport=%s)", SERVER_NAME, args.host, args.port, args.transport)
     logger.info("Webhook: %s", "configured" if WEBHOOK_URL else "NOT configured")
     logger.info("DeepSeek: %s", "configured" if DEEPSEEK_API_KEY else "NOT configured — trigger will fail!")
-    logger.info("Trigger secret: %s", "configured" if TRIGGER_SECRET else "NOT configured")
 
-    # Get FastMCP's internal Starlette app
-    mcp_app = mcp._create_app()
-    logger.info("MCP app type: %s", type(mcp_app).__name__)
+    # ── Get FastMCP's ASGI app ──
+    mcp_app = None
+    for method_name in ["sse_app", "_create_app", "create_app", "build_app"]:
+        if hasattr(mcp, method_name):
+            try:
+                mcp_app = getattr(mcp, method_name)()
+                logger.info("Created MCP app via mcp.%s()", method_name)
+                break
+            except Exception as e:
+                logger.warning("mcp.%s() failed: %s", method_name, e)
 
-    # Directly insert /trigger route into Starlette's route list (index 0 = first match)
-    trigger_route = Route("/trigger", trigger_endpoint, methods=["POST"])
-    mcp_app.routes.insert(0, trigger_route)
-    logger.info("Routes after insert: %s", [str(r) for r in mcp_app.routes])
+    if mcp_app is None:
+        logger.info("Falling back to mcp.run()")
+        mcp.run(transport=args.transport, host=args.host, port=args.port)
+        return
+
+    # ── Inject /trigger route ──
+    from starlette.routing import Route as StarletteRoute
+    trigger_route = StarletteRoute("/trigger", trigger_endpoint, methods=["POST"])
+
+    if hasattr(mcp_app, "routes"):
+        mcp_app.routes.insert(0, trigger_route)
+        logger.info("Inserted /trigger route via routes list")
+    else:
+        # Fallback: wrap with ASGI middleware
+        logger.info("No routes list — using ASGI middleware wrapper")
+        _inner = mcp_app
+
+        async def asgi_wrapper(scope, receive, send):
+            if scope["type"] == "http" and scope.get("path") == "/trigger" and scope.get("method") == "POST":
+                request = Request(scope, receive, send)
+                response = await trigger_endpoint(request)
+                await response(scope, receive, send)
+                return
+            await _inner(scope, receive, send)
+
+        mcp_app = asgi_wrapper
 
     uvicorn.run(mcp_app, host=args.host, port=args.port)
 
