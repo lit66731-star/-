@@ -510,33 +510,34 @@ def main():
     parser.add_argument("--transport", default="sse", choices=["sse", "streamable-http"])
     args = parser.parse_args()
 
-    logger.info("Starting '%s' on %s:%d (transport=%s)", SERVER_NAME, args.host, args.port, args.transport)
-    logger.info("Webhook: %s", "configured" if WEBHOOK_URL else "NOT configured")
-    logger.info("DeepSeek: %s", "configured" if DEEPSEEK_API_KEY else "NOT configured — trigger will fail!")
+    logger.info("========================================")
+    logger.info("Starting '%s' v4.0", SERVER_NAME)
+    logger.info("Host: %s  Port: %d  Transport: %s", args.host, args.port, args.transport)
+    logger.info("DeepSeek: %s", "READY" if DEEPSEEK_API_KEY else "MISSING!")
+    logger.info("========================================")
 
-    # Create MCP app using the official sse_app() method
-    mcp_app = mcp.sse_app()
-    logger.info("MCP app created successfully, type=%s", type(mcp_app).__name__)
+    try:
+        mcp_app = mcp.sse_app()
+        logger.info("mcp.sse_app() OK — type=%s", type(mcp_app).__name__)
 
-    # Build a patched ASGI app that intercepts POST /trigger
-    # This runs BEFORE the Starlette router, so it always matches first
-    original_app = mcp_app
+        # Patch with trigger interceptor
+        _inner = mcp_app
 
-    async def patched_asgi(scope, receive, send):
-        # Check for trigger BEFORE any routing happens
-        if scope["type"] == "http":
-            path = scope.get("path", "")
-            method = scope.get("method", "")
-            logger.debug("Request: %s %s", method, path)
-            if path == "/trigger" and method == "POST":
+        async def patched(scope, receive, send):
+            if scope["type"] == "http" and scope.get("path") == "/trigger" and scope.get("method") == "POST":
                 request = Request(scope, receive, send)
                 response = await trigger_endpoint(request)
                 await response(scope, receive, send)
                 return
-        # All other requests go to FastMCP
-        await original_app(scope, receive, send)
+            await _inner(scope, receive, send)
 
-    uvicorn.run(patched_asgi, host=args.host, port=args.port)
+        uvicorn.run(patched, host=args.host, port=args.port)
+
+    except Exception as e:
+        logger.error("Patched app failed: %s", e)
+        logger.info("Falling back to plain mcp.run() — /trigger will NOT work!")
+        logger.info("You must use the generate_now MCP tool instead.")
+        mcp.run(transport=args.transport, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
