@@ -15,9 +15,9 @@ import os
 import json
 import logging
 import argparse
+import asyncio
 import threading
-import hashlib
-import hmac
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -256,6 +256,8 @@ async def trigger_endpoint(request: Request) -> JSONResponse:
     Called by cron-job.org every 5 minutes.
     Reads conversation context → calls DeepSeek → stores pending messages.
     """
+    logger.info("TRIGGER CALLED!")  # <-- 先确认路由通了
+
     # Optional: verify secret to prevent abuse
     if TRIGGER_SECRET:
         body = await request.body()
@@ -503,6 +505,62 @@ async def clear_context() -> str:
 #  App Assembly — ASGI middleware to add /trigger route
 # ═══════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════
+#  Background Auto-Trigger (runs every 5 minutes inside the server)
+# ═══════════════════════════════════════════════════════════════════════
+
+TRIGGER_INTERVAL_SEC = int(os.environ.get("TRIGGER_INTERVAL_SEC", 300))  # 5 min default
+
+async def _do_trigger() -> dict:
+    """Execute one trigger cycle: read context, call DeepSeek, store pending."""
+    entries = _read_entries(limit=30)
+    if not entries:
+        logger.info("Auto-trigger: no context yet, skipped")
+        return {"status": "skipped", "reason": "no context"}
+
+    context_text = _format_entries(entries)
+    messages = await call_deepseek(context_text)
+
+    if not messages:
+        logger.info("Auto-trigger: generation failed")
+        return {"status": "skipped", "reason": "generation failed"}
+
+    batch_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    for i, msg in enumerate(messages):
+        _append_pending({"batch_id": batch_id, "index": i, "content": msg, "status": "pending"})
+
+    # Also send via webhook if configured
+    if WEBHOOK_URL:
+        for msg in messages:
+            try:
+                await post_to_webhook(msg)
+            except Exception as exc:
+                logger.error("Webhook send failed in auto-trigger: %s", exc)
+
+    logger.info("Auto-trigger: generated %d messages (batch=%s)", len(messages), batch_id)
+    return {"status": "ok", "batch_id": batch_id, "count": len(messages)}
+
+
+def _run_trigger_loop():
+    """Background thread: run trigger every TRIGGER_INTERVAL_SEC seconds."""
+    logger.info("Auto-trigger thread started (interval=%ds)", TRIGGER_INTERVAL_SEC)
+
+    # Create an event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    while True:
+        time.sleep(TRIGGER_INTERVAL_SEC)
+        try:
+            loop.run_until_complete(_do_trigger())
+        except Exception as exc:
+            logger.error("Auto-trigger error: %s", exc)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Entrypoint
+# ═══════════════════════════════════════════════════════════════════════
+
 def main():
     parser = argparse.ArgumentParser(description="Auto Messenger MCP Server")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
@@ -511,33 +569,18 @@ def main():
     args = parser.parse_args()
 
     logger.info("========================================")
-    logger.info("Starting '%s' v4.0", SERVER_NAME)
+    logger.info("Starting '%s' v5.0", SERVER_NAME)
     logger.info("Host: %s  Port: %d  Transport: %s", args.host, args.port, args.transport)
     logger.info("DeepSeek: %s", "READY" if DEEPSEEK_API_KEY else "MISSING!")
+    logger.info("Auto-trigger: every %ds", TRIGGER_INTERVAL_SEC)
     logger.info("========================================")
 
-    try:
-        mcp_app = mcp.sse_app()
-        logger.info("mcp.sse_app() OK — type=%s", type(mcp_app).__name__)
+    # Start auto-trigger in background thread
+    trigger_thread = threading.Thread(target=_run_trigger_loop, daemon=True)
+    trigger_thread.start()
 
-        # Patch with trigger interceptor
-        _inner = mcp_app
-
-        async def patched(scope, receive, send):
-            if scope["type"] == "http" and scope.get("path") == "/trigger" and scope.get("method") == "POST":
-                request = Request(scope, receive, send)
-                response = await trigger_endpoint(request)
-                await response(scope, receive, send)
-                return
-            await _inner(scope, receive, send)
-
-        uvicorn.run(patched, host=args.host, port=args.port)
-
-    except Exception as e:
-        logger.error("Patched app failed: %s", e)
-        logger.info("Falling back to plain mcp.run() — /trigger will NOT work!")
-        logger.info("You must use the generate_now MCP tool instead.")
-        mcp.run(transport=args.transport, host=args.host, port=args.port)
+    # Run MCP server (blocks)
+    mcp.run(transport=args.transport, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
