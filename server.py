@@ -500,60 +500,52 @@ async def clear_context() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  App Assembly & Entrypoint
+#  App Assembly — ASGI middleware to add /trigger route
 # ═══════════════════════════════════════════════════════════════════════
 
-def build_app() -> Starlette:
+class TriggerMiddleware:
     """
-    Build a combined Starlette app with:
-      - /sse          → FastMCP SSE handler
-      - /messages/    → FastMCP messages handler
-      - /trigger      → custom trigger endpoint (POST)
+    ASGI middleware that intercepts POST /trigger before it reaches FastMCP.
+    All other requests pass through to the MCP handler unchanged.
     """
-    # Get FastMCP's internal ASGI app
-    # FastMCP 2.x creates the app during run(). We peek at _create_app.
-    # Actually, let's access the app through the FastMCP instance.
-    try:
-        # FastMCP 2.x/3.x: mcp.app or mcp._app
-        mcp_app = getattr(mcp, 'app', None) or getattr(mcp, '_app', None)
-        if mcp_app is None:
-            # Force app creation by accessing the property
-            if hasattr(mcp, 'sse_app'):
-                mcp_app = mcp.sse_app()
-            elif hasattr(mcp, 'build_app'):
-                mcp_app = mcp.build_app()
-            else:
-                # Last resort: create it ourselves
-                mcp_app = mcp._create_app()
-    except Exception:
-        mcp_app = mcp._create_app()
+    def __init__(self, app):
+        self.app = app
 
-    # Our custom trigger route
-    trigger_route = Route("/trigger", trigger_endpoint, methods=["POST"])
-
-    # Create combined routes: custom first, then MCP handles the rest
-    from starlette.routing import Mount
-    routes = [
-        trigger_route,
-        Mount("/", app=mcp_app),
-    ]
-
-    return Starlette(routes=routes)
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"] == "/trigger" and scope["method"] == "POST":
+            request = Request(scope, receive, send)
+            response = await trigger_endpoint(request)
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Auto Messenger MCP Server")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
     parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--transport", default="sse", choices=["sse", "streamable-http"])
     args = parser.parse_args()
 
-    logger.info("Starting '%s' on %s:%d", SERVER_NAME, args.host, args.port)
+    logger.info("Starting '%s' on %s:%d (transport=%s)", SERVER_NAME, args.host, args.port, args.transport)
     logger.info("Webhook: %s", "configured" if WEBHOOK_URL else "NOT configured")
-    logger.info("DeepSeek: %s", "configured" if DEEPSEEK_API_KEY else "NOT configured")
-    logger.info("Trigger secret: %s", "configured" if TRIGGER_SECRET else "NOT configured (anyone can trigger)")
+    logger.info("DeepSeek: %s", "configured" if DEEPSEEK_API_KEY else "NOT configured — trigger will fail!")
+    logger.info("Trigger secret: %s", "configured" if TRIGGER_SECRET else "NOT configured")
 
-    app = build_app()
-    uvicorn.run(app, host=args.host, port=args.port)
+    # Let FastMCP build its Starlette app, then wrap with middleware
+    try:
+        mcp_app = mcp._create_app()
+    except Exception:
+        # Fallback: let FastMCP create app via run's internal path
+        # Some versions expose the app differently
+        if hasattr(mcp, 'sse_app'):
+            mcp_app = mcp.sse_app()
+        else:
+            raise RuntimeError("Cannot create FastMCP app — unknown version")
+
+    # Wrap with trigger middleware
+    wrapped = TriggerMiddleware(mcp_app)
+    uvicorn.run(wrapped, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
