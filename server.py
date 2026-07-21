@@ -503,23 +503,6 @@ async def clear_context() -> str:
 #  App Assembly — ASGI middleware to add /trigger route
 # ═══════════════════════════════════════════════════════════════════════
 
-class TriggerMiddleware:
-    """
-    ASGI middleware that intercepts POST /trigger before it reaches FastMCP.
-    All other requests pass through to the MCP handler unchanged.
-    """
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"] == "/trigger" and scope["method"] == "POST":
-            request = Request(scope, receive, send)
-            response = await trigger_endpoint(request)
-            await response(scope, receive, send)
-            return
-        await self.app(scope, receive, send)
-
-
 def main():
     parser = argparse.ArgumentParser(description="Auto Messenger MCP Server")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
@@ -532,20 +515,16 @@ def main():
     logger.info("DeepSeek: %s", "configured" if DEEPSEEK_API_KEY else "NOT configured — trigger will fail!")
     logger.info("Trigger secret: %s", "configured" if TRIGGER_SECRET else "NOT configured")
 
-    # Let FastMCP build its Starlette app, then wrap with middleware
-    try:
-        mcp_app = mcp._create_app()
-    except Exception:
-        # Fallback: let FastMCP create app via run's internal path
-        # Some versions expose the app differently
-        if hasattr(mcp, 'sse_app'):
-            mcp_app = mcp.sse_app()
-        else:
-            raise RuntimeError("Cannot create FastMCP app — unknown version")
+    # Get FastMCP's internal Starlette app
+    mcp_app = mcp._create_app()
+    logger.info("MCP app type: %s", type(mcp_app).__name__)
 
-    # Wrap with trigger middleware
-    wrapped = TriggerMiddleware(mcp_app)
-    uvicorn.run(wrapped, host=args.host, port=args.port)
+    # Directly insert /trigger route into Starlette's route list (index 0 = first match)
+    trigger_route = Route("/trigger", trigger_endpoint, methods=["POST"])
+    mcp_app.routes.insert(0, trigger_route)
+    logger.info("Routes after insert: %s", [str(r) for r in mcp_app.routes])
+
+    uvicorn.run(mcp_app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
